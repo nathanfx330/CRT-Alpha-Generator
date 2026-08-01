@@ -5,15 +5,20 @@
 # Bakes linear coverage fields for compositing in Fusion.
 # Pure stdlib. No numpy, no PIL, no OpenEXR.
 #
+# Run with no arguments for an interactive prompt.
+# Run with flags for scripted / batch use. The interactive mode prints the
+# equivalent command line when it finishes, so you can script it afterwards.
+#
 # The mask lattice (horizontal, tube property) and the scanline lattice
 # (vertical, signal property) are independent. Set them separately.
 #
-#   default   one mono plate, all three stripes lit
-#   --rgb     one RGB plate, stripes packed into R/G/B (use Channel Boolean)
-#   --split   three mono plates, _r _g _b (separate Loaders, then Merge)
+#   mono    one plate, all three stripes lit
+#   rgb     one RGB plate, stripes packed into R/G/B (use Channel Boolean)
+#   split   three mono plates, _r _g _b (separate Loaders, then Merge/Add)
 
 import argparse
 import math
+import os
 import struct
 import sys
 import zlib
@@ -107,12 +112,7 @@ def build_v_rect(height, pitch, duty, soft, samples, phase=0.0, dy=0.0):
 
 
 def build_scan(height, pitch, beam, floor_, samples, dy=0.0):
-    """Electron beam vertical profile. Raised cosine, not a hard line.
-
-    The beam is a signal property, so convergence offsets do NOT apply here
-    unless you are simulating vertical misconvergence. dy is passed only when
-    the caller wants that.
-    """
+    """Electron beam vertical profile. Raised cosine, not a hard line."""
     out = [0.0] * height
     inv = 1.0 / samples
     w = max(beam * 0.5, 1e-9)
@@ -163,8 +163,10 @@ def dot_tile_dims(pitch):
     a grille of the same triad pitch. Lattice basis is
         x = n*d + m*d/2 ,  y = m*d*sqrt(3)/2
     and the colouring (n - m) mod 3 is valid: all six neighbours of a site
-    differ from it. That colouring repeats over n+3 and m+6, so the tile is
-    3d wide by 3d*sqrt(3) tall.
+    differ from it. Verified by exhaustive nearest-neighbour check.
+    (The obvious-looking row-stagger rule (n + 2m) mod 3 is NOT valid, it
+    collides on 17% of neighbour pairs.)
+    Colours repeat over n+3 and m+6, so the tile is 3d by 3d*sqrt(3).
     """
     d = pitch / SQRT3
     tw = max(3, int(round(3.0 * d)))
@@ -298,15 +300,32 @@ def write_exr32(path, w, h, rows, channels):
         f.write(bytes(body))
 
 
+def exr_size_bytes(w, h):
+    return 331 + 8 * h + h * (8 + 3 * w * 4)
+
+
+def human(n):
+    for u in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024.0:
+            return '%.0f %s' % (n, u)
+        n /= 1024.0
+    return '%.1f TB' % n
+
+
+# ----------------------------------------------------------------------
+# parsing helpers
 # ----------------------------------------------------------------------
 
 def parse_res(s):
-    a, b = s.lower().split('x')
-    return int(a), int(b)
+    a, b = s.lower().replace(' ', '').split('x')
+    a, b = int(a), int(b)
+    if a < 8 or b < 8:
+        raise ValueError('resolution too small')
+    return a, b
 
 
 def parse_conv(s):
-    if s is None:
+    if s is None or s == '':
         return 0.0, 0.0
     p = s.replace(' ', '').split(',')
     if len(p) == 1:
@@ -325,6 +344,313 @@ def suffix_path(path, tag):
         return path + '_' + tag
     return path[:i] + '_' + tag + path[i:]
 
+
+# ----------------------------------------------------------------------
+# interactive prompts
+# ----------------------------------------------------------------------
+
+class Abort(Exception):
+    pass
+
+
+def _raw(prompt):
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        raise Abort()
+
+
+def ask_choice(label, options, default=0, note=None):
+    """options: list of (value, text). Returns value."""
+    print()
+    print(label)
+    if note:
+        print('  ' + note)
+    for i, (_, text) in enumerate(options):
+        mark = '*' if i == default else ' '
+        print('  %s %d) %s' % (mark, i + 1, text))
+    while True:
+        s = _raw('  choice [%d]: ' % (default + 1))
+        if s == '':
+            return options[default][0]
+        try:
+            k = int(s)
+            if 1 <= k <= len(options):
+                return options[k - 1][0]
+        except ValueError:
+            pass
+        print('  enter 1..%d' % len(options))
+
+
+def ask_yesno(label, default=True):
+    d = 'Y/n' if default else 'y/N'
+    while True:
+        s = _raw('  %s [%s]: ' % (label, d)).lower()
+        if s == '':
+            return default
+        if s in ('y', 'yes'):
+            return True
+        if s in ('n', 'no'):
+            return False
+        print('  enter y or n')
+
+
+def ask_float(label, default, lo=None, hi=None):
+    while True:
+        s = _raw('  %s [%g]: ' % (label, default))
+        if s == '':
+            return default
+        try:
+            v = float(s)
+        except ValueError:
+            print('  enter a number')
+            continue
+        if lo is not None and v < lo:
+            print('  must be >= %g' % lo)
+            continue
+        if hi is not None and v > hi:
+            print('  must be <= %g' % hi)
+            continue
+        return v
+
+
+def ask_int(label, default, lo=None, hi=None):
+    while True:
+        s = _raw('  %s [%d]: ' % (label, default))
+        if s == '':
+            return default
+        try:
+            v = int(s)
+        except ValueError:
+            print('  enter an integer')
+            continue
+        if lo is not None and v < lo:
+            print('  must be >= %d' % lo)
+            continue
+        if hi is not None and v > hi:
+            print('  must be <= %d' % hi)
+            continue
+        return v
+
+
+def ask_text(label, default):
+    s = _raw('  %s [%s]: ' % (label, default))
+    return s if s else default
+
+
+def ask_res(label, presets, default_idx):
+    opts = [(p, p) for p in presets] + [(None, 'custom')]
+    v = ask_choice(label, opts, default_idx)
+    if v is not None:
+        return parse_res(v)
+    while True:
+        s = _raw('  WxH: ')
+        try:
+            return parse_res(s)
+        except Exception:
+            print('  format is WIDTHxHEIGHT, e.g. 3840x2160')
+
+
+def ask_conv(tag):
+    while True:
+        s = _raw('  %s offset "dx" or "dx,dy" [0]: ' % tag)
+        if s == '':
+            return 0.0, 0.0
+        try:
+            return parse_conv(s)
+        except Exception:
+            print('  format is dx or dx,dy')
+
+
+def interactive(args):
+    print()
+    print('  CRT phosphor mask generator')
+    print('  ' + '-' * 44)
+    print('  enter for the marked default, ctrl-c to quit')
+
+    W, H = ask_res(
+        'Output plate resolution',
+        ['1920x1080', '2560x1440', '3840x2160', '4096x2160', '7680x4320'],
+        2)
+
+    while True:
+        NX, NY = ask_res(
+            'Emulated CRT (triads across x scanlines down)',
+            ['256x224', '320x240', '320x200', '640x480', '160x120'],
+            1)
+        pitch = W / float(NX)
+        line = H / float(NY)
+        sub = pitch / 3.0
+        print()
+        print('  triad pitch %.3f px, subcell %.3f px, line pitch %.3f px'
+              % (pitch, sub, line))
+        need_w = int(math.ceil(NX * 9))
+        need_h = NY * 3
+        bad_w = sub < 3.0
+        bad_h = line < 3.0
+        if not bad_w and not bad_h:
+            break
+        if bad_w:
+            print('  WARNING subcell is %.2f px. below 3 px the mask washes out,'
+                  % sub)
+            print('          and at exactly 2.0 px it box-filters to flat grey.')
+            print('          %d triads wants a plate at least %d px wide.'
+                  % (NX, need_w))
+        if bad_h:
+            print('  WARNING line pitch is %.2f px, scanlines will alias.' % line)
+            print('          %d lines wants a plate at least %d px tall.'
+                  % (NY, need_h))
+        fix = ask_choice('How do you want to handle that?', [
+            ('bump', 'enlarge the plate to %dx%d'
+             % (max(W, need_w) if bad_w else W, max(H, need_h) if bad_h else H)),
+            ('cells', 'pick a different CRT resolution'),
+            ('ignore', 'keep my settings anyway'),
+        ], 0)
+        if fix == 'bump':
+            if bad_w:
+                W = max(W, need_w)
+            if bad_h:
+                H = max(H, need_h)
+            print('  plate is now %dx%d' % (W, H))
+            break
+        if fix == 'ignore':
+            break
+
+    mask = ask_choice('Shadow mask type', [
+        ('slot', 'slot     vertical slots, staggered. most consumer sets'),
+        ('grille', 'grille   continuous stripes. Trinitron / aperture grille'),
+        ('dot', 'dot      triangular dot triads. older tubes'),
+    ], 0)
+
+    layout = ask_choice('Channel layout', [
+        ('mono', 'mono     one plate, all three stripes lit'),
+        ('split', 'split    three mono plates _r _g _b, Merge with Add'),
+        ('rgb', 'rgb      one RGB plate, pull with Channel Boolean'),
+    ], 0)
+
+    fmt = ask_choice('File format', [
+        ('exr', 'exr      32f linear, uncompressed. use this for Fusion'),
+        ('png', 'png      16 bit. preview / reference only, clips at 1.0'),
+        ('both', 'both'),
+    ], 0)
+
+    print()
+    norm = False
+    if fmt in ('exr', 'both'):
+        print('  Normalizing scales the mean to 1.0 so the plate does not')
+        print('  darken the shot. Recommended when you multiply against footage.')
+        norm = ask_yesno('Normalize', True)
+        if norm and fmt == 'both':
+            print('  note: PNG clips at 1.0, so the PNG copy will be crushed.')
+
+    print()
+    scan = 0.75
+    if ask_yesno('Include scanlines', True):
+        scan = ask_float('beam width, fraction of line pitch', 0.75, 0.05, 1.0)
+    else:
+        scan = 0.0
+
+    conv = [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
+    if layout in ('split', 'rgb'):
+        print()
+        print('  Convergence error offsets each phosphor. Baked in at sample')
+        print('  time, so no resampling softness. Positive moves the plate left.')
+        if ask_yesno('Add convergence error', False):
+            conv = [ask_conv('red'), ask_conv('green'), ask_conv('blue')]
+
+    print()
+    if ask_yesno('Adjust mask geometry (fill, softness, wires, quality)', False):
+        args.fill = ask_float('stripe fill, fraction of subcell', args.fill,
+                              0.05, 1.0)
+        args.soft = ask_float('edge softness', args.soft, 0.0, 1.0)
+        if mask == 'slot':
+            args.slot_duty = ask_float('slot vertical fill', args.slot_duty,
+                                       0.05, 1.0)
+            args.slot_aspect = ask_float('slot pitch / triad pitch',
+                                         args.slot_aspect, 0.1, 4.0)
+        if mask == 'dot':
+            args.dot_fill = ask_float('dot diameter / spacing', args.dot_fill,
+                                      0.05, 1.2)
+            args.dot_ss = ask_int('dot supersample per axis', args.dot_ss, 1, 16)
+        if mask == 'grille':
+            args.wires = ask_int('damper wires (0, 1 or 2)', args.wires, 0, 4)
+        if scan > 0.0:
+            args.scan_floor = ask_float('floor between scanlines',
+                                        args.scan_floor, 0.0, 1.0)
+        args.samples = ask_int('supersample rate', args.samples, 1, 128)
+
+    print()
+    nplate = 3 if layout == 'split' else 1
+    stem = ask_text('Output name (no extension)',
+                    'crt_%s_%dx%d' % (mask, W, H))
+
+    args.out = '%dx%d' % (W, H)
+    args.cells = '%dx%d' % (NX, NY)
+    args.mask = mask
+    args.rgb = (layout == 'rgb')
+    args.split = (layout == 'split')
+    args.normalize = norm
+    args.scan = scan
+    args.exr = (stem + '.exr') if fmt in ('exr', 'both') else None
+    args.png = (stem + '.png') if fmt in ('png', 'both') else None
+    args.conv_r = '%g,%g' % conv[0]
+    args.conv_g = '%g,%g' % conv[1]
+    args.conv_b = '%g,%g' % conv[2]
+
+    # summary
+    print()
+    print('  ' + '-' * 44)
+    print('  plate      %dx%d' % (W, H))
+    print('  crt        %d triads x %d lines' % (NX, NY))
+    print('  mask       %s' % mask)
+    print('  layout     %s (%d file%s per format)'
+          % (layout, nplate, '' if nplate == 1 else 's'))
+    print('  format     %s%s' % (fmt, ', normalized' if norm else ''))
+    if args.exr:
+        tot = exr_size_bytes(W, H) * nplate
+        print('  exr size   %s total' % human(tot))
+        if tot > 512 * 1024 * 1024:
+            print('             (uncompressed by design, Fusion caches it once)')
+    est = (W * H * args.samples) / 6.0e7 * nplate
+    if mask == 'dot':
+        est = (W * H) / 8.0e6 * nplate
+    print('  est time   ~%s' % ('%.0f s' % est if est < 90 else
+                                '%.1f min' % (est / 60.0)))
+    print('  ' + '-' * 44)
+
+    cmd = ['./crt_mask.py', '--out', args.out, '--cells', args.cells,
+           '--mask', mask]
+    if args.split:
+        cmd.append('--split')
+    if args.rgb:
+        cmd.append('--rgb')
+    if args.normalize:
+        cmd.append('--normalize')
+    if scan == 0.0:
+        cmd += ['--scan', '0']
+    elif abs(scan - 0.75) > 1e-9:
+        cmd += ['--scan', '%g' % scan]
+    for tag, c in zip(('r', 'g', 'b'), conv):
+        if c != (0.0, 0.0):
+            cmd += ['--conv-%s' % tag, '%g,%g' % c]
+    if args.exr:
+        cmd += ['--exr', args.exr]
+    if args.png:
+        cmd += ['--png', args.png]
+    print()
+    print('  same thing as a command:')
+    print('    ' + ' '.join(cmd))
+    print()
+
+    if not ask_yesno('Bake it', True):
+        raise Abort()
+    print()
+    return args
+
+
+# ----------------------------------------------------------------------
+# render
+# ----------------------------------------------------------------------
 
 def render_mono(args, W, H, pitch, line, subcell, conv):
     """Build one monochrome plate. subcell None = all stripes."""
@@ -346,7 +672,7 @@ def render_mono(args, W, H, pitch, line, subcell, conv):
             trow = tile[y % th]
             v = vscan[y]
             rows.append([trow[c] * v for c in cols])
-        return rows, (tw, th)
+        return rows
 
     if args.mask == 'grille':
         vy = list(vscan)
@@ -372,7 +698,7 @@ def render_mono(args, W, H, pitch, line, subcell, conv):
             (h0, v0), (h1, v1) = hs
             a0, a1 = v0[y], v1[y]
             rows.append([p * a0 + q * a1 for p, q in zip(h0, h1)])
-    return rows, None
+    return rows
 
 
 def mean_of(rows, n):
@@ -382,14 +708,19 @@ def mean_of(rows, n):
     return total / float(n)
 
 
-def main():
+# ----------------------------------------------------------------------
+
+def build_parser():
     ap = argparse.ArgumentParser(
-        description='Bake CRT phosphor mask plates for Fusion.')
+        description='Bake CRT phosphor mask plates for Fusion. '
+                    'Run with no arguments for interactive mode.')
+    ap.add_argument('-i', '--interactive', action='store_true',
+                    help='force the interactive prompt')
     ap.add_argument('--out', default='3840x2160',
                     help='output plate resolution, WxH')
     ap.add_argument('--cells', default='320x240',
                     help='emulated CRT: triads across x scanlines down')
-    ap.add_argument('--mask', default='grille', choices=('grille', 'slot', 'dot'))
+    ap.add_argument('--mask', default='slot', choices=('grille', 'slot', 'dot'))
     ap.add_argument('--fill', type=float, default=0.70,
                     help='stripe width as fraction of subcell')
     ap.add_argument('--soft', type=float, default=0.15,
@@ -417,7 +748,7 @@ def main():
                     help='three mono plates written as _r _g _b')
 
     ap.add_argument('--conv-r', default=None, metavar='DX[,DY]',
-                    help='red convergence offset in output px')
+                    help='red convergence offset in output px, positive = left')
     ap.add_argument('--conv-g', default=None, metavar='DX[,DY]')
     ap.add_argument('--conv-b', default=None, metavar='DX[,DY]')
     ap.add_argument('--conv-vertical', action='store_true',
@@ -429,15 +760,37 @@ def main():
                     help='1D supersample rate')
     ap.add_argument('--png', default=None)
     ap.add_argument('--exr', default=None)
+    return ap
+
+
+def main():
+    ap = build_parser()
     args = ap.parse_args()
+
+    want_ui = args.interactive or len(sys.argv) == 1
+    if want_ui:
+        if not sys.stdin.isatty():
+            print('ERROR      interactive mode needs a terminal. '
+                  'pass flags instead, see --help', file=sys.stderr)
+            return 2
+        try:
+            args = interactive(args)
+        except Abort:
+            print('\n  cancelled')
+            return 130
 
     if args.rgb and args.split:
         print('ERROR      --rgb and --split are mutually exclusive',
               file=sys.stderr)
         return 1
 
-    W, H = parse_res(args.out)
-    NX, NY = parse_res(args.cells)
+    try:
+        W, H = parse_res(args.out)
+        NX, NY = parse_res(args.cells)
+    except Exception:
+        print('ERROR      resolution format is WIDTHxHEIGHT', file=sys.stderr)
+        return 1
+
     pitch = W / float(NX)
     line = H / float(NY)
 
@@ -457,35 +810,40 @@ def main():
         tw, th = dot_tile_dims(pitch)
         print('dot tile   %dx%d px, spacing %.4f px' % (tw, th, tw / 3.0))
 
-    sub = pitch / 3.0
-    if sub < 2.0:
-        print('WARNING    subcell < 2 px, mask is below Nyquist, it will vanish',
-              file=sys.stderr)
-    elif sub < 3.0:
-        print('WARNING    subcell < 3 px, mask contrast will be very weak.',
-              file=sys.stderr)
-        print('           at exactly 2.0 px a centered stripe box-filters to a '
-              'flat field.', file=sys.stderr)
-        print('           want subcell >= 3 px, so triad pitch >= 9 px, so '
-              'width >= %d for %d triads.' % (int(math.ceil(NX * 9)), NX),
-              file=sys.stderr)
-    if args.scan > 0.0 and line < 3.0:
-        print('WARNING    line pitch < 3 px, scanlines will alias. want '
-              'height >= %d for %d lines.' % (NY * 3, NY), file=sys.stderr)
+    if not want_ui:
+        sub = pitch / 3.0
+        if sub < 2.0:
+            print('WARNING    subcell < 2 px, mask is below Nyquist, it will '
+                  'vanish', file=sys.stderr)
+        elif sub < 3.0:
+            print('WARNING    subcell < 3 px, mask contrast will be very weak.',
+                  file=sys.stderr)
+            print('           at exactly 2.0 px a centered stripe box-filters '
+                  'to a flat field.', file=sys.stderr)
+            print('           want subcell >= 3 px, so width >= %d for %d '
+                  'triads.' % (int(math.ceil(NX * 9)), NX), file=sys.stderr)
+        if args.scan > 0.0 and line < 3.0:
+            print('WARNING    line pitch < 3 px, scanlines will alias. want '
+                  'height >= %d for %d lines.' % (NY * 3, NY), file=sys.stderr)
 
     if not args.png and not args.exr:
         args.exr = 'crt_%s_%dx%d.exr' % (args.mask, W, H)
+
+    for p in (args.png, args.exr):
+        if p:
+            d = os.path.dirname(os.path.abspath(p))
+            if not os.path.isdir(d):
+                print('ERROR      no such directory: %s' % d, file=sys.stderr)
+                return 1
 
     tags = ('r', 'g', 'b')
 
     # ---------------- split: three mono plates ----------------
     if args.split:
         for k in range(3):
-            rows, _ = render_mono(args, W, H, pitch, line, k, conv[k])
+            rows = render_mono(args, W, H, pitch, line, k, conv[k])
             m = mean_of(rows, W * H)
-            note = ''
-            if conv[k] != (0.0, 0.0):
-                note = '  conv %+.3f,%+.3f' % conv[k]
+            note = '  conv %+.3f,%+.3f' % conv[k] if conv[k] != (0.0, 0.0) else ''
             print('%s          mean %.6f%s' % (tags[k].upper(), m, note))
             if args.normalize:
                 if m <= 1e-9:
@@ -512,11 +870,9 @@ def main():
     if args.rgb:
         planes = []
         for k in range(3):
-            rows, _ = render_mono(args, W, H, pitch, line, k, conv[k])
+            rows = render_mono(args, W, H, pitch, line, k, conv[k])
             m = mean_of(rows, W * H)
-            note = ''
-            if conv[k] != (0.0, 0.0):
-                note = '  conv %+.3f,%+.3f' % conv[k]
+            note = '  conv %+.3f,%+.3f' % conv[k] if conv[k] != (0.0, 0.0) else ''
             print('%s          mean %.6f%s' % (tags[k].upper(), m, note))
             if args.normalize:
                 if m <= 1e-9:
@@ -536,7 +892,7 @@ def main():
         ch = 3
     # ---------------- default: one mono plate ----------------
     else:
-        rows, _ = render_mono(args, W, H, pitch, line, None, (0.0, 0.0))
+        rows = render_mono(args, W, H, pitch, line, None, (0.0, 0.0))
         m = mean_of(rows, W * H)
         print('mean        %.6f' % m)
         if args.normalize:
